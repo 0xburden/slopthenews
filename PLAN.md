@@ -895,7 +895,9 @@ Each task ends with a "Done when" check. Run `pnpm -r typecheck` and `pnpm -r te
 every commit. Commit after each task.
 
 ### Phase 1 — Scaffold
-- **T1. Workspace.** Root `package.json` (scripts: `dev`, `typecheck`, `test`),
+- **T1. Workspace.** First run `corepack enable && corepack use pnpm@10` in the repo root, so
+  every `pnpm` command uses pnpm 10 (the machine may have a newer global pnpm). Root
+  `package.json` (scripts: `dev`, `typecheck`, `test`),
   `pnpm-workspace.yaml` (`apps/*`, `packages/*`), `tsconfig.base.json` (strict, `moduleResolution: "bundler"`),
   `.gitignore` (`node_modules`, `.next`, `.env`, `.models`), `.env.example` (section 2). Create
   `packages/db`, `packages/core`, `apps/worker` with `package.json` (exports as in section 1),
