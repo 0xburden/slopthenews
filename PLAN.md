@@ -18,7 +18,7 @@ and share. Think of it as a public editorial benchmark.
 |---|---|
 | Language | TypeScript (strict), Node 22 (≥ 22.12) |
 | Package manager | pnpm 10 workspaces |
-| Web | Next.js 15 (App Router, Server Components, Server Actions) |
+| Web | Next.js 16 (App Router, Server Components, Server Actions) |
 | Styling | Tailwind CSS v4 + `@tailwindcss/typography` + Headless UI v2 + `@heroicons/react` |
 | Theming | `next-themes` (light / dark / system, class strategy) |
 | Fonts | `next/font/google`: Newsreader (serif), Inter (sans), JetBrains Mono (mono) |
@@ -40,24 +40,29 @@ and share. Think of it as a public editorial benchmark.
 | Deploy | Docker Compose on Dokploy: `postgres`, `migrate`, `web`, `worker` |
 
 ### Version pins (required)
-Install these **major versions**. Newer majors have different APIs from what this plan
-describes. Use `pnpm add <pkg>@<major>`.
+Install these **major versions** (`pnpm add <pkg>@<major>`). Other majors have different APIs
+from what this plan describes.
 
-| Package | Major | Notes |
-|---|---|---|
-| `next` | 15 | create the app with `pnpm dlx create-next-app@15` |
-| `react`, `react-dom` | 19 | |
-| `tailwindcss`, `@tailwindcss/postcss` | 4 | no `tailwind.config.*` file (section 7) |
-| `@headlessui/react` | 2 | v2 names: `TabGroup/TabList/Tab/TabPanels/TabPanel`, `MenuButton/MenuItems/MenuItem`, `PopoverButton/PopoverPanel` |
-| `next-themes` | 0.4 | |
-| `pg-boss` | 10 | API in section 5 |
-| `ai` | 5 | use `maxOutputTokens` (not `maxTokens`); usage is `usage.inputTokens` / `usage.outputTokens` |
-| `@ai-sdk/openai-compatible` | 1 | |
-| `better-auth` | 1 | |
-| `drizzle-orm` / `drizzle-kit` | 0.4x / 0.3x | |
-| `react-markdown` | 10 | |
-| `@huggingface/transformers` | 3 | |
-| `zod` | 3 | |
+The implementing model (Inkling 2 Mini, released 2026-11-20) has no published knowledge cutoff;
+it is estimated at late 2025 to mid 2026. A major is pinned to the newest version released by
+about **late 2025**, so the model has probably seen it. Anything newer stays one major back.
+
+| Package | Major | First release | Notes |
+|---|---|---|---|
+| `next` | 16 | 2025-10 | create with `pnpm dlx create-next-app@16`. See the Next 16 notes in section 6 |
+| `react`, `react-dom` | 19 | 2024-12 | |
+| `tailwindcss`, `@tailwindcss/postcss` | 4 | 2025-01 | no `tailwind.config.*` file (section 7) |
+| `@headlessui/react` | 2 | 2024-05 | v2 names: `TabGroup/TabList/Tab/TabPanels/TabPanel`, `MenuButton/MenuItems/MenuItem`, `PopoverButton/PopoverPanel` |
+| `next-themes` | 0.4 | — | |
+| `pg-boss` | 12 | 2025-11 | ESM only, **named** export `import { PgBoss } from 'pg-boss'`; API in section 5.2 |
+| `ai` | 5 | 2025-07 | v6 (2025-12) and v7 (2026-06) are too new. Use `maxOutputTokens` (not `maxTokens`); usage is `usage.inputTokens` / `usage.outputTokens` |
+| `@ai-sdk/openai-compatible` | 1 | 2025-07 | matches `ai@5` |
+| `better-auth` | 1 | 2024-11 | |
+| `drizzle-orm` / `drizzle-kit` | 0.4x / 0.3x | — | |
+| `react-markdown` | 10 | 2025-02 | |
+| `zod` | 4 | 2025-07 | `import { z } from 'zod'`. Prefer `z.email()`, `z.url()` over `z.string().email()` |
+| `@huggingface/transformers` | 3 | 2024-10 | v4 (2026-03) is too new |
+| `pnpm` | 10 | 2025-01 | v11+ is too new |
 
 Root `package.json` sets `"packageManager": "pnpm@10.x.x"` (use the installed version) and
 `"engines": { "node": ">=22.12" }`.
@@ -388,9 +393,9 @@ pipeline.tick (cron PIPELINE_CRON)
 Each job sends the next one when it finishes. `pipeline.tick` stops early (logs and returns) if
 there is no enabled author with an enabled provider.
 
-### 5.2 pg-boss v10 setup (`apps/worker/src/boss.ts`, `apps/worker/src/index.ts`)
+### 5.2 pg-boss v12 setup (`apps/worker/src/boss.ts`, `apps/worker/src/index.ts`)
 ```ts
-import PgBoss from 'pg-boss';
+import { PgBoss } from 'pg-boss';
 const boss = new PgBoss(config.DATABASE_URL);
 boss.on('error', console.error);
 await boss.start();
@@ -407,10 +412,8 @@ await boss.schedule('pipeline.tick', config.PIPELINE_CRON);
 
 // Handlers receive an ARRAY of jobs. Use batchSize 1 and destructure.
 await boss.work('ingest', { batchSize: 1 }, async ([job]) => { await ingest(); await boss.send('cluster', {}); });
-// generate: call work() twice to get 2 concurrent jobs (v10 has no concurrency option).
-for (let i = 0; i < 2; i++) {
-  await boss.work('generate', { batchSize: 1, includeMetadata: true }, async ([job]) => generate(job));
-}
+// generate: 2 jobs at a time.
+await boss.work('generate', { batchSize: 1, includeMetadata: true, localConcurrency: 2 }, async ([job]) => generate(job));
 ```
 - Graceful shutdown: on `SIGTERM`/`SIGINT` call `await boss.stop()`.
 - **The worker owns the queues and the pg-boss schema.** The web app only sends jobs (section 6.4).
@@ -636,8 +639,13 @@ no media, `{{media}}` is `(none)`.
 
 ## 6. Web App (`apps/web`)
 
-Next.js 15 notes: `params`, `searchParams`, `headers()`, and `cookies()` are **async**
-(`const { slug } = await params`). Pages with Headless UI interactivity use small client
+Next.js 16 notes:
+- `params`, `searchParams`, `headers()`, and `cookies()` are **async**
+  (`const { slug } = await params`). This includes `opengraph-image.tsx` and `generateMetadata`.
+- Turbopack is the default for `next dev` and `next build`. Keep it.
+- `next lint` no longer exists. Lint with `eslint` directly (or skip lint in MVP).
+- Do not enable `cacheComponents` or use `'use cache'`. This app needs no caching layer (6.6).
+- There is no `middleware.ts` in this app. Auth checks happen in pages and actions (6.1). Pages with Headless UI interactivity use small client
 components; do **not** put `'use client'` on a page.
 
 ### 6.1 Auth (`apps/web/src/lib/`)
@@ -887,7 +895,7 @@ Each task ends with a "Done when" check. Run `pnpm -r typecheck` and `pnpm -r te
 every commit. Commit after each task.
 
 ### Phase 1 — Scaffold
-- **T1. Workspace.** Root `package.json` (scripts: `dev`, `typecheck`, `test`, `lint`),
+- **T1. Workspace.** Root `package.json` (scripts: `dev`, `typecheck`, `test`),
   `pnpm-workspace.yaml` (`apps/*`, `packages/*`), `tsconfig.base.json` (strict, `moduleResolution: "bundler"`),
   `.gitignore` (`node_modules`, `.next`, `.env`, `.models`), `.env.example` (section 2). Create
   `packages/db`, `packages/core`, `apps/worker` with `package.json` (exports as in section 1),
@@ -898,8 +906,8 @@ every commit. Commit after each task.
   from `.env` (`POSTGRES_USER/PASSWORD/DB`), volume `pgdata`, port `5432:5432`, healthcheck
   `pg_isready -U $POSTGRES_USER`.
   *Done when:* `docker compose up -d postgres` shows the service as healthy and `psql $DATABASE_URL -c 'select 1'` works.
-- **T3. Next.js app + design system.** `pnpm dlx create-next-app@15 apps/web` (TypeScript, App Router,
-  Tailwind, `src/` dir, no ESLint prompt changes). Rename the package to `@stn/web`. Add
+- **T3. Next.js app + design system.** `pnpm dlx create-next-app@16 apps/web` (TypeScript, App Router,
+  Tailwind, `src/` dir; answer "No" to ESLint and React Compiler). Rename the package to `@stn/web`. Add
   `@headlessui/react@2`, `@heroicons/react`, `@tailwindcss/typography`, `next-themes@0.4`.
   Symlink `apps/web/.env` → `../../.env`. Set up `next.config.ts` (section 1), fonts (7.1),
   `globals.css` (7.2), `Providers` + `ThemeSwitcher` (7.4), and the masthead (7.6) **without the
