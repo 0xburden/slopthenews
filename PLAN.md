@@ -17,7 +17,11 @@ and share. Think of it as a public editorial benchmark.
 | Language | TypeScript (strict), Node 22 |
 | Package manager | pnpm workspaces |
 | Web | Next.js 15 (App Router, Server Components, Server Actions) |
-| Styling | Tailwind CSS v4 + Headless UI (`@headlessui/react`) + `@heroicons/react` |
+| Styling | Tailwind CSS v4 + `@tailwindcss/typography` + Headless UI (`@headlessui/react`) + `@heroicons/react` |
+| Theming | `next-themes` (light / dark / system, class strategy) |
+| Fonts | `next/font/google`: Newsreader (serif), Inter (sans), JetBrains Mono (mono). See section 7 |
+| Article format | Markdown written by the model, rendered with `react-markdown` + `remark-gfm` |
+| Markdown parsing (validation) | `mdast-util-from-markdown` + `mdast-util-gfm` + `micromark-extension-gfm` + `mdast-util-to-string` |
 | Database | PostgreSQL 16 + `pgvector` extension |
 | ORM | Drizzle ORM + drizzle-kit |
 | Auth | Better Auth, email + password only, `admin` plugin for roles |
@@ -90,7 +94,8 @@ provider
 
 author
   id, providerId -> provider.id, slug text unique, displayName text, modelId text,
-  bio text null, temperature real default 0.7, maxTokens int default 2000,
+  bio text null, color text default '#64748b',   -- hex, used for the author chip dot
+  temperature real default 0.7, maxTokens int default 2000,
   enabled bool default true
 
 feed
@@ -122,10 +127,11 @@ generation_run
 
 post
   id, runId -> generation_run.id unique, eventId -> event.id, authorId -> author.id,
-  slug text unique, headline text, dek text, body jsonb, publishedAt timestamp,
+  slug text unique, headline text, dek text, bodyMarkdown text, wordCount int,
+  publishedAt timestamp,
   likeCount int default 0, dislikeCount int default 0, commentCount int default 0,
   favoriteCount int default 0, shareCount int default 0,
-  citationValidRatio real
+  citationValidRatio real, paragraphCitationRatio real
 
 post_citation
   postId -> post.id, index int, rawArticleId -> raw_article.id
@@ -145,23 +151,33 @@ Indexes: `raw_article(publishedAt)`, `raw_article(eventId)`, `event(status, last
 
 ---
 
-## 4. Article Output Contract (`packages/core/src/article-schema.ts`)
+## 4. Article Output Contract (`packages/core/src/article.ts`)
 
-Every author must return JSON matching this Zod schema:
+Authors write **Markdown**, not JSON. Models are much better at writing Markdown than at
+writing long text inside escaped JSON strings, and Markdown keeps formatting (subheads, lists,
+emphasis, tables). That formatting is part of what we are comparing.
 
-```ts
-export const ArticleSchema = z.object({
-  headline: z.string().min(10).max(140),
-  dek: z.string().min(20).max(300),           // one-sentence summary
-  sections: z.array(z.object({
-    heading: z.string().max(100).optional(),
-    paragraphs: z.array(z.object({
-      text: z.string().min(1),
-      citations: z.array(z.number().int().min(1)).min(1), // source numbers from the packet
-    })).min(1),
-  })).min(1).max(8),
-});
+### Required response shape
+```markdown
+# Headline goes here
+
+> One-sentence summary (the "dek").
+
+Opening paragraph with facts and citations [1][3].
+
+## Optional subhead
+
+More paragraphs. Where sources disagree, say so [2][4].
 ```
+
+Rules given to the model (also shown on `/about`):
+1. The first line is the headline as a level-1 heading (`# `).
+2. Next comes a single-line blockquote (`> `) with a one-sentence summary.
+3. The body uses only: paragraphs, `##` / `###` subheads, bullet or numbered lists, `**bold**`,
+   `*italic*`, blockquotes for short attributed quotes, and tables.
+4. No links, images, HTML, or code blocks. Sources are cited only with `[n]`.
+5. Cite sources by number in square brackets right after the claim: `[1]`. For multiple
+   sources use `[1][3]`.
 
 ### Source packet payload (what every author receives)
 ```json
@@ -172,15 +188,43 @@ export const ArticleSchema = z.object({
   ]
 }
 ```
-At most 8 sources per packet, one per outlet first, then newest.
+At most 8 sources per packet. Take one article per outlet first, then fill with the newest.
+
+### Parsing: `parseArticle(raw: string, packet) → ParsedArticle | { error }`
+Steps, in this order:
+1. **Normalize.** Trim. If the whole response is wrapped in a code fence (```` ``` ```` or
+   ```` ```markdown ````), unwrap it. Remove `<think>…</think>` blocks (some reasoning
+   models emit these). Drop every line before the first line that starts with `# `.
+2. **Normalize citations** with plain string replacement (not the Markdown parser):
+   `[1, 3]` / `[1,3]` → `[1][3]`; `[^1]` → `[1]`; `【1】` → `[1]`.
+3. **Split.** Headline = text of the first H1 line. Dek = the first blockquote line right
+   after it (strip the `> `). Body = everything after the dek.
+4. **Check citations.** Find every `\[(\d+)\]` in the body. A number is valid when
+   1 ≤ n ≤ number of sources in the packet. Remove invalid markers from the body string.
+5. **Analyze** the body with `fromMarkdown(body, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] })`:
+   - `wordCount` = word count of `toString(tree)`.
+   - `paragraphCitationRatio` = paragraphs (and list items) containing at least one `[n]` /
+     all paragraphs (and list items).
+   - Collect the plain text of each paragraph for the copy check.
+
+`ParsedArticle` = `{ headline, dek, bodyMarkdown, wordCount, citations: number[] (unique, sorted),
+citationValidRatio, paragraphCitationRatio }`.
+
+The body is stored **as Markdown text** (`post.bodyMarkdown`). It is never re-serialized
+(re-serializing can escape `[1]` into `\[1]`). Unsafe elements are removed at render time
+(section 7).
 
 ### Validation rules (`packages/core/src/validate.ts`)
-1. Output parses as JSON and matches `ArticleSchema`. If it does not, the run status is `invalid`.
-2. Every citation number exists in the packet. Bad numbers are removed, and the article is
-   `invalid` if fewer than 50% of its citations are valid.
-3. `citationValidRatio` = valid citations / total citations.
-4. No paragraph may contain 30 or more consecutive words copied from any source. If one does,
-   the run is `invalid`.
+The run is `invalid` (with a clear `error` message) if any rule fails:
+1. There is no H1 headline, or the headline is not 10–140 characters long.
+2. There is no dek, or the dek is not 20–300 characters long.
+3. `wordCount` is under 150 or over 1500.
+4. Fewer than 50% of citation markers are valid, or there are no valid citations.
+5. `paragraphCitationRatio` is under 0.5.
+6. Any paragraph contains 30 or more consecutive words copied from one source's text.
+   Compare lowercased words with punctuation removed.
+
+`citationValidRatio` = valid markers / all markers (before invalid ones are removed).
 
 ---
 
@@ -201,19 +245,54 @@ pipeline.tick (cron PIPELINE_CRON)
 | `cluster` | — | For each `raw_article` with `eventId IS NULL`: find nearest `event` with `lastSeenAt` within `CLUSTER_WINDOW_HOURS` and cosine similarity ≥ `CLUSTER_SIMILARITY`. If found: attach, update centroid (running mean), `lastSeenAt`, `outletCount` (distinct outlets). Else: create event with `title = article.title`. Then send `select`. | events |
 | `select` | — | Pick events with `status='open'`, `outletCount ≥ MIN_OUTLETS_PER_EVENT`, ordered by `outletCount DESC, lastSeenAt DESC`, limit `EVENTS_PER_RUN`. Set `status='queued'`, send `build-packet` for each. | — |
 | `build-packet` | `{eventId}` | Create `source_packet` (skip if exists — **this is the de-dupe**). For each enabled author, insert `generation_run` (pending) and send `generate`. Set event `status='generated'`. | runs |
-| `generate` | `{runId}` | Load author + decrypt provider key. Call model via AI SDK `generateText` with the active prompt template; parse JSON from the response (strip code fences). Validate. On success: insert `post` + `post_citation`, `status='succeeded'`. Record latency and tokens either way. Retry limit 2 for network errors only. | post |
+| `generate` | `{runId}` | Load author + decrypt provider key. Call model via AI SDK `generateText` with the active prompt template. Run `parseArticle` + validate on the response text. On success: insert `post` + `post_citation`, `status='succeeded'`. Record latency and tokens either way. Retry limit 2 for network errors only. | post |
 
 Concurrency: `generate` uses `teamSize: 2`. Each job is idempotent: check state before acting.
 
-Note: `generateText` + manual JSON parsing is used instead of `generateObject` because not
-every OpenAI-compatible endpoint supports structured output.
+Note: plain `generateText` returning Markdown works with every OpenAI-compatible endpoint.
+No JSON mode or structured-output support is needed.
 
 ### Prompt template v1 (seeded, `packages/db/src/seed.ts`)
-- **System:** "You are a news writer. Write one neutral, factual news article that combines the
-  provided sources. Use only facts found in the sources. Every paragraph must cite the sources
-  it uses by number. Note where sources disagree. Do not copy sentences. Respond with JSON
-  only, matching this shape: {schema description}."
-- **User:** `Event: {{eventTitle}}\n\nSources:\n{{numbered sources}}`
+Placeholders: `{{eventTitle}}`, `{{sourceCount}}`, `{{sources}}`.
+
+**System:**
+```
+You are a news writer for a news site. Write one neutral, factual news article that combines
+the provided sources into a single story.
+
+Rules:
+- Use only facts found in the sources. Do not add outside knowledge.
+- Cite sources by number in square brackets right after each claim, like [1] or [2][3].
+  Only use numbers from 1 to {{sourceCount}}.
+- Every paragraph must have at least one citation.
+- Where sources disagree, say so and cite each side.
+- Do not copy sentences from the sources. Short quotes are allowed if attributed.
+- Length: 300 to 800 words.
+
+Format your answer as Markdown, exactly like this:
+# Headline
+
+> One-sentence summary.
+
+Body paragraphs. You may use ## subheads, lists, **bold**, *italic*, and tables.
+Do not use links, images, HTML, or code blocks.
+
+Reply with the article only.
+```
+
+**User:**
+```
+Event: {{eventTitle}}
+
+Sources:
+{{sources}}
+```
+Each source in `{{sources}}` is rendered as:
+```
+[n] Outlet — Title (publishedAt ISO date)
+text
+```
+with a blank line between sources.
 
 ### Seed feeds (all checked working)
 All HTTP requests (RSS and article pages) **must** send the header
@@ -246,8 +325,8 @@ from `GET /models`, which the admin "Test connection" button calls.
 | Route | Content |
 |---|---|
 | `/` | Latest events (paginated, 20). Each card shows the event title, number of sources, and one chip per author post linking to it. |
-| `/events/[id]` | Event title, Headless UI `TabGroup` with one tab per author post (headline, dek, body, per-post stats), shared source list. |
-| `/posts/[slug]` | Full post: author, date, body with superscript citation links `[n]`, sources list, action bar, comments. Includes Open Graph meta. |
+| `/events/[id]` | Event title, Headless UI `TabGroup` with one tab per author post (headline, dek, rendered Markdown body, per-post stats), shared source list. |
+| `/posts/[slug]` | Full post: author, date, rendered Markdown body with citation superscripts, sources list, action bar, comments. Includes Open Graph meta. |
 | `/authors` | All authors with stats: posts, likes, dislikes, approval %, average `citationValidRatio`, average latency. |
 | `/authors/[slug]` | Author info + stats + their posts. |
 | `/about` | Methodology: the pipeline, the active prompt template text, the validation rules. |
@@ -259,10 +338,10 @@ from `GET /models`, which the admin "Test connection" button calls.
 |---|---|
 | `/admin` | Counts + last 20 generation runs + "Run pipeline now" button. |
 | `/admin/providers` | List / create / edit / delete. API key field is write-only (never sent to the client). "Test connection" calls `GET {baseUrl}/models`. |
-| `/admin/authors` | List / create / edit / enable / disable. Model picker filled from the provider's `/models` result. |
+| `/admin/authors` | List / create / edit / enable / disable. Model picker filled from the provider's `/models` result. Color picker (`<input type="color">`) for the chip color. |
 | `/admin/feeds` | List / create / enable / disable, showing `lastFetchedAt` and `lastError`. |
 | `/admin/prompts` | List versions, create a new version, set it as active. |
-| `/admin/runs` | Paginated runs with status filter; detail view shows `rawOutput` + `error`. |
+| `/admin/runs` | Paginated runs with status filter; detail view shows `rawOutput` (as plain text in a `<pre>`), `error`, and a rendered preview. |
 | `/admin/comments` | Latest comments, hide/unhide. |
 
 ### Server actions (`apps/web/src/actions/`)
@@ -280,17 +359,102 @@ X (`https://x.com/intent/post?url=`), Reddit (`https://www.reddit.com/submit?url
 
 ---
 
-## 7. Security Rules
+## 7. Design System (apps/web)
+
+The look is a calm, newspaper-like reading page. Keep chrome minimal. Use hairline rules
+instead of shadows. Use serif type for reading, sans for UI, and mono for model data.
+
+### Fonts (`apps/web/src/app/fonts.ts`)
+| Role | Font | Used for |
+|---|---|---|
+| Serif (`--font-serif`) | **Newsreader**, variable, with optical sizing (`axes: ['opsz']`) | Headlines, deks, article body |
+| Sans (`--font-sans`) | **Inter**, variable | Navigation, buttons, forms, admin, metadata |
+| Mono (`--font-mono`) | **JetBrains Mono** | Model IDs, stats (latency, tokens, ratios) |
+
+Load all three with `next/font/google` (`display: 'swap'`, `subsets: ['latin']`) and put
+their `.variable` class names on `<html>`. Newsreader was designed for on-screen news reading.
+If it looks too narrow, use Source Serif 4 instead (only this file changes).
+
+### Type scale
+- Article body: `prose prose-lg font-serif`, line height 1.7, max width `68ch`.
+- Post headline: `font-serif font-semibold text-4xl md:text-5xl tracking-tight leading-tight`.
+- Dek: `font-serif italic text-xl text-muted`.
+- Metadata line (author · date · read time): `font-sans text-sm text-muted`.
+- Stats: `font-mono text-xs tabular-nums`.
+
+### Color tokens (`apps/web/src/app/globals.css`)
+Define these as CSS variables and map them in Tailwind's `@theme` (`--color-paper`, and so on)
+so classes like `bg-paper text-ink border-rule` work.
+
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| `paper` | `#FAF8F3` | `#141311` | Page background |
+| `surface` | `#FFFFFF` | `#1C1B19` | Cards, menus, inputs |
+| `ink` | `#1C1B19` | `#ECE8E1` | Main text |
+| `muted` | `#6B6760` | `#A29D94` | Secondary text |
+| `rule` | `#E4E0D8` | `#2E2C28` | Borders, dividers |
+| `accent` | `#B4232A` | `#F0626A` | Links, active tab, focus ring, "AI-generated" label |
+
+Every text color meets WCAG AA contrast on `paper` in both modes.
+
+### Light / dark mode
+- Wrap the app in `next-themes` `ThemeProvider` with `attribute="class"`,
+  `defaultTheme="system"`, `enableSystem`, `disableTransitionOnChange`. Add
+  `suppressHydrationWarning` to `<html>`.
+- In `globals.css`: `@custom-variant dark (&:where(.dark, .dark *));`, and set the dark token
+  values under `.dark { … }`.
+- Theme switcher in the header: a Headless UI `Menu` with three items, System / Light / Dark,
+  using heroicons `ComputerDesktopIcon` / `SunIcon` / `MoonIcon`. Render it only after mount
+  to avoid a hydration mismatch.
+- Article prose: `prose dark:prose-invert`, with the typography plugin colors set to the tokens.
+
+### Markdown rendering (`apps/web/src/components/ArticleBody.tsx`)
+- `react-markdown` with `remarkPlugins={[remarkGfm, remarkCitations]}` and `skipHtml`.
+- `allowedElements`: `p, h2, h3, ul, ol, li, strong, em, blockquote, table, thead, tbody, tr, th, td, hr, sup, del`.
+  Use `unwrapDisallowed` so that links, images, and anything else become plain text.
+- Custom components: `h1` renders as `h2` (just in case), `table` is wrapped in a
+  horizontally scrollable `div`.
+- `remarkCitations` (`apps/web/src/lib/remark-citations.ts`): a small plugin that walks text
+  nodes and replaces each `[n]` with a `sup` element node. Its `data.hName = 'sup'`, and its
+  child is the text `n`. Give it a Vitest test.
+- The `sup` component renders `<CitationRef n={n} />`: a Headless UI `Popover` that shows
+  the outlet, source title, and an external link. It links to `#source-n` in the source list.
+
+### Page patterns
+- **Masthead:** wordmark "slopthenews" in Newsreader bold, today's date in small caps sans,
+  a thin double rule underneath. Navigation on the right: Authors, About, theme switcher,
+  user menu.
+- **Home:** the first event is the "lead" (large serif headline, full width). The rest are a
+  list separated by rules. Each event shows the event title, the source outlet names, and one
+  **author chip** per post: a colored dot (`author.color`) plus the display name. The chip
+  links to that post.
+- **Post page:** a small "AI-generated · {model id in mono}" label in `accent` above the
+  headline, then headline, dek, metadata line, body, numbered "Sources" list (`id="source-n"`),
+  action bar (like, dislike, favorite, share as heroicon buttons with counts), and comments.
+- **Event page:** headline and outlet list, then Headless UI `TabGroup`. Each tab label is
+  an author chip; each panel is that author's post plus a stats strip (words, latency,
+  tokens, citation ratio).
+- **Admin:** plain sans UI with tables and forms, the same tokens, and no serif.
+- **Responsive:** mobile-first single column; the home lead plus list becomes two columns at `lg`.
+- **Accessibility:** semantic `<article>`, `<header>`, `<time dateTime>`; visible
+  `focus-visible:ring-2 ring-accent`; respect `prefers-reduced-motion`; icon buttons have
+  `aria-label`s.
+
+---
+
+## 8. Security Rules
 - Provider API keys are encrypted with AES-256-GCM (`packages/core/src/crypto.ts`),
   stored as `iv:tag:ciphertext` in base64. They are only decrypted in the worker and in the
   admin "Test connection" server action.
 - Every admin server action re-checks `role === 'admin'` on the server.
 - Comment bodies are rendered as plain text, never HTML.
-- Model output is rendered from the validated JSON only, never as raw HTML/markdown.
+- Model Markdown is rendered only through `ArticleBody` (`skipHtml` + `allowedElements`).
+  Raw HTML from a model is never rendered, and model output never contains clickable links;
+  the only links are to sources from our own database.
 
 ---
 
-## 8. Task List
+## 9. Task List
 
 Each task ends with a "Done when" check. Commit after each task.
 
@@ -300,9 +464,12 @@ Each task ends with a "Done when" check. Commit after each task.
   *Done when:* `pnpm install` succeeds.
 - **T2. Postgres.** `docker-compose.yml` with the `pgvector/pgvector:pg16` image, volume
   `pgdata`, port 5432. *Done when:* `docker compose up -d postgres` works and `psql` connects.
-- **T3. Next.js app.** Create `apps/web` (App Router, TS, Tailwind v4, `src/` dir). Add
-  `@headlessui/react` and `@heroicons/react`. Basic layout with a header (site name, Authors,
-  About, login/user menu). *Done when:* `pnpm --filter @stn/web dev` shows the layout.
+- **T3. Next.js app + design system.** Create `apps/web` (App Router, TS, Tailwind v4, `src/`
+  dir). Add `@headlessui/react`, `@heroicons/react`, `@tailwindcss/typography`, `next-themes`.
+  Set up fonts, color tokens, dark mode, and the masthead with theme switcher (section 7).
+  Add a `/styleguide` dev page that shows headings, a sample Markdown article, buttons, and
+  author chips. *Done when:* the styleguide looks right in light and dark, the theme choice
+  survives a reload, and there is no flash of the wrong theme.
 
 ### Phase 2 — Database
 - **T4. Drizzle setup.** `packages/db`: `client.ts` (exports `db`), `drizzle.config.ts`, the
@@ -321,12 +488,15 @@ Each task ends with a "Done when" check. Commit after each task.
 ### Phase 3 — Core library
 - **T8. crypto.ts** `encrypt(plain)` / `decrypt(stored)`. *Done when:* a Vitest round-trip
   test passes.
-- **T9. article-schema.ts + validate.ts** (section 4). *Done when:* Vitest tests cover
-  a valid article, bad JSON, a bad citation number, and copied text.
+- **T9. article.ts + validate.ts** (section 4). Put sample model responses in
+  `packages/core/test/fixtures/*.md`. *Done when:* Vitest tests cover a valid article, a
+  response wrapped in a code fence, a `<think>` block, `[1, 3]` normalization, a missing
+  headline, a missing dek, an out-of-range citation, low paragraph citation coverage, and
+  copied text.
 - **T10. llm.ts** `createClient(provider)` → AI SDK openai-compatible instance;
   `listModels(provider)`; `writeArticle(author, provider, packet, template)` returns
-  `{ text, usage, latencyMs }`. `extractJson(text)` strips code fences. *Done when:* the
-  `extractJson` unit tests pass.
+  `{ text, usage, latencyMs }`. *Done when:* it typechecks and a manual script
+  (`pnpm --filter @stn/core try-llm`) prints one article from a real provider.
 - **T11. prompt.ts** `renderPrompt(template, packet)`. *Done when:* a unit test checks that
   sources are numbered correctly.
 
@@ -355,7 +525,8 @@ Each task ends with a "Done when" check. Commit after each task.
 ### Phase 6 — Public site
 - **T22. Home feed** `/`.
 - **T23. Event page** `/events/[id]` with author tabs.
-- **T24. Post page** `/posts/[slug]` with citations + sources.
+- **T24. Post page** `/posts/[slug]` with `ArticleBody`, `remarkCitations`, `CitationRef`
+  popovers, and the sources list (section 7).
 - **T25. Authors list + author page** with stats (SQL aggregates).
 - **T26. About page** showing the active prompt.
 *Done when (all):* pages render from real pipeline data, and empty states look fine.
@@ -378,7 +549,7 @@ update correctly.
 
 ---
 
-## 9. Later (not MVP)
+## 10. Later (not MVP)
 Email verification before commenting (SMTP via nodemailer + Better Auth
 `requireEmailVerification`), event updates/regeneration, blind mode, leaderboard trends,
 side-by-side compare view, search.
